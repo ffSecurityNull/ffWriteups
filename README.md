@@ -10,11 +10,3 @@ Estudiante de ciberseguridad enfocado en pentesting web. Construyendo una práct
 
 Writeups publicados
 TryHackMe — Hacker Holidays 2026 (NoSQL injection, SSTI/RCE, Zip Slip, race conditions, Azure pentesting)
-Estructura
-.
-├── index.html            ← página principal (índice de casos)
-├── assets/
-│   └── style.css         ← identidad visual del sitio
-└── writeups/
-    ├── template.html     ← plantilla en blanco, copiar para cada writeup nuevo
-    └── example-byte-lotus.html  ← ejemplo relleno
